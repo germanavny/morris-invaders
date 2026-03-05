@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Morris Invaders 👾</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      color: #0f0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow: hidden;
+      user-select: none;
+    }
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 6px 14px;
+      border: 1px solid #0f0;
+      border-bottom: none;
+      width: 800px;
+      max-width: 100%;
+    }
+    #toolbar h1 { font-size: 13px; flex: 1; }
+    #statusText { font-size: 12px; color: #ff0; }
+    #loadBtn {
+      background: transparent;
+      color: #0f0;
+      border: 1px solid #0f0;
+      padding: 3px 10px;
+      cursor: pointer;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      font-size: 12px;
+    }
+    #loadBtn:hover { background: #0f0; color: #000; }
+    #fileInput { display: none; }
+    canvas {
+      display: block;
+      border: 2px solid #0f0;
+      box-shadow: 0 0 25px rgba(0,255,0,0.25);
+      max-width: 100%;
+    }
+    #hint { font-size: 11px; color: #333; padding: 6px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <h1>👾 Morris Invaders</h1>
+    <span id="statusText">Waiting for image...</span>
+    <button id="loadBtn" onclick="document.getElementById('fileInput').click()">📷 Change Image</button>
+    <input type="file" id="fileInput" accept="image/*">
+  </div>
+  <canvas id="c" width="800" height="600"></canvas>
+  <div id="hint">← → Move &nbsp;|&nbsp; SPACE Shoot &nbsp;|&nbsp; ENTER Start &nbsp;|&nbsp; P Pause</div>
+
+<script>
+'use strict';
+
+// ─── Canvas setup ───────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const W = 800, H = 600;
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+const PW = 52, PH = 36;          // player width/height
+const PS = 5;                    // player speed
+const BW = 4,  BH = 14;          // bullet width/height
+const PBS = 11;                  // player bullet speed
+const EBS = 4;                   // enemy bullet speed
+const ES  = 54;                  // enemy sprite size
+const ECOLS = 8, EROWS = 4;
+const EGAPX = 12, EGAPY = 12;
+const ESTART_Y = 52;
+const EDROP = 20;                // pixels enemies drop per wall-hit
+const MAX_PB = 3;                // max player bullets on screen
+const INVFRAMES = 100;
+const SHOOT_CD = 14;
+
+// ─── Stars ──────────────────────────────────────────────────────────────────
+const STARS = Array.from({length: 130}, () => ({
+  x: Math.random() * W,
+  y: Math.random() * H,
+  r: Math.random() * 1.4 + 0.3,
+  spd: Math.random() * 0.25 + 0.05
+}));
+
+// ─── Game state ─────────────────────────────────────────────────────────────
+let gs = 'menu'; // menu | playing | paused | gameover | win
+let player, enemies, pb, eb, exps;
+let score, lives, level;
+let eDir, eTimer, eInterval, sTimer, sInterval;
+let morrisImg = null;
+let tick = 0;
+
+// ─── Input ──────────────────────────────────────────────────────────────────
+const keys = {}, once = {};
+document.addEventListener('keydown', e => {
+  if (['Space','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.code))
+    e.preventDefault();
+  if (!keys[e.code]) once[e.code] = true;
+  keys[e.code] = true;
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+function eat(k) { const v = once[k]; once[k] = false; return v; }
+
+// ─── Image loading ──────────────────────────────────────────────────────────
+function loadImg(src, cb) {
+  const img = new Image();
+  img.onload = () => cb(img);
+  img.onerror = () => {};
+  img.src = src;
+}
+loadImg('morris.png', img => { morrisImg = img; setStatus('✓ Morris loaded!', '#0f0'); });
+
+document.getElementById('fileInput').addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  const r = new FileReader();
+  r.onload = ev => loadImg(ev.target.result, img => {
+    morrisImg = img; setStatus('✓ Image loaded!', '#0f0');
+  });
+  r.readAsDataURL(f);
+});
+function setStatus(t, c) {
+  const el = document.getElementById('statusText');
+  el.textContent = t; el.style.color = c || '#ff0';
+}
+
+// ─── Audio ──────────────────────────────────────────────────────────────────
+let ac;
+function beep(freq, type, dur, vol = 0.12) {
+  try {
+    if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.connect(g); g.connect(ac.destination);
+    o.type = type;
+    o.frequency.setValueAtTime(freq, ac.currentTime);
+    o.frequency.exponentialRampToValueAtTime(freq * 0.25, ac.currentTime + dur);
+    g.gain.setValueAtTime(vol, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + dur);
+    o.start(); o.stop(ac.currentTime + dur);
+  } catch(_) {}
+}
+const sfx = {
+  shoot:   () => beep(880, 'square',   0.08, 0.09),
+  explode: () => beep(220, 'sawtooth', 0.22, 0.18),
+  hit:     () => beep(110, 'sawtooth', 0.40, 0.28),
+  win:     () => [523,659,784,1047].forEach((f,i) => setTimeout(() => beep(f,'square',0.28,0.14), i*160))
+};
+
+// ─── Init / reset ────────────────────────────────────────────────────────────
+function startGame() {
+  score = 0; lives = 3; level = 1;
+  player = { x: W/2 - PW/2, y: H - PH - 22, cd: 0, inv: 0 };
+  pb = []; eb = []; exps = [];
+  spawnEnemies(1);
+  gs = 'playing';
+}
+
+function spawnEnemies(lvl) {
+  const totalW = ECOLS * ES + (ECOLS - 1) * EGAPX;
+  const sx = (W - totalW) / 2;
+  enemies = [];
+  for (let r = 0; r < EROWS; r++)
+    for (let c = 0; c < ECOLS; c++)
+      enemies.push({ x: sx + c * (ES + EGAPX), y: ESTART_Y + r * (ES + EGAPY),
+                     alive: true, row: r });
+  eDir = 1; eTimer = 0;
+  eInterval = Math.max(10, 50 - (lvl - 1) * 8);
+  sInterval  = Math.max(35, 120 - (lvl - 1) * 18);
+  sTimer = sInterval;
+  pb = []; eb = [];
+}
+
+// ─── Update ──────────────────────────────────────────────────────────────────
+function update() {
+  tick++;
+
+  // Pause toggle
+  if ((gs === 'playing' || gs === 'paused') && eat('KeyP'))
+    gs = gs === 'playing' ? 'paused' : 'playing';
+
+  if (gs === 'menu')     { if (eat('Enter') || eat('Space')) startGame(); return; }
+  if (gs === 'gameover' || gs === 'win') { if (eat('Enter') || eat('Space')) gs = 'menu'; return; }
+  if (gs === 'paused')   return;
+  if (gs !== 'playing')  return;
+
+  // ── Player movement ──────────────────────────────────────────────────────
+  if (keys['ArrowLeft'])  player.x = Math.max(0, player.x - PS);
+  if (keys['ArrowRight']) player.x = Math.min(W - PW, player.x + PS);
+  if (player.cd  > 0) player.cd--;
+  if (player.inv > 0) player.inv--;
+
+  // ── Player shoot ─────────────────────────────────────────────────────────
+  if (keys['Space'] && player.cd === 0 && pb.length < MAX_PB) {
+    pb.push({ x: player.x + PW/2 - BW/2, y: player.y });
+    player.cd = SHOOT_CD;
+    sfx.shoot();
+  }
+
+  // ── Move bullets ─────────────────────────────────────────────────────────
+  pb.forEach(b => { b.y -= PBS; if (b.y + BH <= 0) b.dead = true; });
+  eb.forEach(b => { b.y += EBS; if (b.y    >= H)   b.dead = true; });
+
+  // ── Move enemies ─────────────────────────────────────────────────────────
+  if (++eTimer >= eInterval) {
+    eTimer = 0;
+    const alive = enemies.filter(e => e.alive);
+    const hitWall = alive.some(e =>
+      (eDir > 0 && e.x + ES + 14 > W) ||
+      (eDir < 0 && e.x - 14 < 0)
+    );
+    if (hitWall) {
+      eDir *= -1;
+      alive.forEach(e => e.y += EDROP);
+      if (alive.some(e => e.y + ES >= player.y)) { endGame(); return; }
+    } else {
+      alive.forEach(e => e.x += eDir * 14);
+    }
+  }
+
+  // ── Enemy shoot ──────────────────────────────────────────────────────────
+  if (--sTimer <= 0) {
+    sTimer = sInterval;
+    const alive = enemies.filter(e => e.alive);
+    if (alive.length) {
+      const s = alive[Math.floor(Math.random() * alive.length)];
+      eb.push({ x: s.x + ES/2 - BW/2, y: s.y + ES });
+    }
+  }
+
+  // ── Collisions: player bullets vs enemies ────────────────────────────────
+  for (const b of pb) {
+    if (b.dead) continue;
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      if (hit(b.x, b.y, BW, BH, e.x, e.y, ES, ES)) {
+        e.alive = false; b.dead = true;
+        score += 10 * (EROWS - e.row);
+        exps.push({ x: e.x + ES/2, y: e.y + ES/2, t: 22 });
+        sfx.explode();
+        break;
+      }
+    }
+  }
+
+  // ── Collisions: enemy bullets vs player ──────────────────────────────────
+  if (player.inv === 0) {
+    for (const b of eb) {
+      if (b.dead) continue;
+      if (hit(b.x, b.y, BW, BH, player.x, player.y, PW, PH)) {
+        b.dead = true; lives--;
+        player.inv = INVFRAMES;
+        sfx.hit();
+        if (lives <= 0) { endGame(); return; }
+        break;
+      }
+    }
+  }
+
+  // ── Cleanup ──────────────────────────────────────────────────────────────
+  pb   = pb.filter(b => !b.dead);
+  eb   = eb.filter(b => !b.dead);
+  exps = exps.filter(ex => { ex.t--; return ex.t > 0; });
+
+  // ── Level complete ───────────────────────────────────────────────────────
+  if (enemies.every(e => !e.alive)) {
+    level++;
+    if (level > 6) { gs = 'win'; sfx.win(); }
+    else spawnEnemies(level);
+  }
+}
+
+function endGame() { gs = 'gameover'; sfx.hit(); }
+function hit(ax,ay,aw,ah, bx,by,bw,bh) {
+  return ax < bx+bw && ax+aw > bx && ay < by+bh && ay+ah > by;
+}
+
+// ─── Draw ────────────────────────────────────────────────────────────────────
+function draw() {
+  // Background
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  STARS.forEach(s => {
+    s.y += s.spd; if (s.y > H) s.y = 0;
+    const a = 0.35 + 0.65 * Math.abs(Math.sin(tick * 0.018 + s.x * 0.1));
+    ctx.fillStyle = `rgba(255,255,255,${a.toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2); ctx.fill();
+  });
+
+  if (gs === 'menu') { drawMenu(); return; }
+
+  drawHUD();
+  drawEnemies();
+  drawExplosions();
+  drawBullets();
+  drawPlayer();
+
+  if (gs === 'paused')   overlay('PAUSED', '#ff0', 'Press P to continue');
+  if (gs === 'gameover') overlay('GAME OVER', '#f44', `Score: ${score}   |   ENTER for menu`);
+  if (gs === 'win')      overlay('YOU WIN! 🎉', '#ff0', `Final score: ${score}   |   ENTER for menu`);
+}
+
+// ── Menu ─────────────────────────────────────────────────────────────────────
+function drawMenu() {
+  ctx.textAlign = 'center';
+
+  ctx.shadowColor = '#0f0'; ctx.shadowBlur = 22;
+  ctx.fillStyle = '#0f0';
+  ctx.font = 'bold 54px "Segoe UI", Arial';
+  ctx.fillText('Morris Invaders 👾', W/2, 110);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = '#0ff';
+  ctx.font = '17px "Segoe UI", Arial';
+  ctx.fillText('Defend the galaxy from the faces of Morris!', W/2, 152);
+
+  // Preview enemies row
+  if (morrisImg) {
+    const previewSizes = [48, 56, 64, 56, 48];
+    let px = W/2 - (previewSizes.reduce((a,b)=>a+b+14,0) - 14) / 2;
+    previewSizes.forEach(sz => {
+      drawMorris(px, 175, sz);
+      px += sz + 14;
+    });
+  } else {
+    ctx.fillStyle = '#555';
+    ctx.font = '14px "Segoe UI", Arial';
+    ctx.fillText('[Loading image...]', W/2, 220);
+  }
+
+  // Score legend
+  ctx.font = '13px "Segoe UI", Arial';
+  const labels = ['Row 1: 40 pts','Row 2: 30 pts','Row 3: 20 pts','Row 4: 10 pts'];
+  const colors  = ['#f88','#fa8','#ff8','#af8'];
+  labels.forEach((txt, i) => {
+    ctx.fillStyle = colors[i];
+    ctx.fillText(txt, W/2, 310 + i * 26);
+  });
+
+  ctx.fillStyle = '#888';
+  ctx.font = '13px "Segoe UI", Arial';
+  ctx.fillText('← → Move  |  SPACE Shoot  |  P Pause  |  6 Levels', W/2, 440);
+
+  if (tick % 70 < 48) {
+    ctx.shadowColor = '#0f0'; ctx.shadowBlur = 12;
+    ctx.fillStyle = '#0f0';
+    ctx.font = 'bold 24px "Segoe UI", Arial';
+    ctx.fillText('Press ENTER / SPACE to start', W/2, 490);
+    ctx.shadowBlur = 0;
+  }
+}
+
+// ── HUD ──────────────────────────────────────────────────────────────────────
+function drawHUD() {
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#0f0';
+  ctx.font = '15px "Segoe UI", Arial';
+  ctx.fillText(`Score: ${score}`, 14, 28);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#0cc';
+  ctx.fillText(`Level ${level} / 6`, W/2, 28);
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#f55';
+  ctx.fillText('❤ '.repeat(lives).trim(), W - 14, 28);
+
+  ctx.strokeStyle = '#1a1a1a';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, 37); ctx.lineTo(W, 37); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, H-13); ctx.lineTo(W, H-13); ctx.stroke();
+}
+
+// ── Enemies ──────────────────────────────────────────────────────────────────
+function drawEnemies() {
+  for (const e of enemies) {
+    if (!e.alive) continue;
+    drawMorris(e.x, e.y, ES);
+  }
+}
+
+function drawMorris(x, y, size) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(x + size/2, y + size/2, size/2 - 1, 0, Math.PI*2);
+  ctx.clip();
+
+  if (morrisImg) {
+    ctx.drawImage(morrisImg, x, y, size, size);
+  } else {
+    // Alien placeholder when no image
+    ctx.fillStyle = '#1a3a1a';
+    ctx.fillRect(x, y, size, size);
+    ctx.fillStyle = '#0f0';
+    const ew = size * 0.18, eh = size * 0.18;
+    ctx.fillRect(x + size*0.22, y + size*0.30, ew, eh);
+    ctx.fillRect(x + size*0.60, y + size*0.30, ew, eh);
+    ctx.beginPath();
+    ctx.arc(x + size/2, y + size*0.68, size*0.19, 0, Math.PI);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // Pulsing ring
+  const hue = (120 + tick * 1.5) % 360;
+  ctx.beginPath();
+  ctx.arc(x + size/2, y + size/2, size/2 - 1, 0, Math.PI*2);
+  ctx.strokeStyle = `hsl(${hue},100%,60%)`;
+  ctx.lineWidth = 1.8;
+  ctx.stroke();
+}
+
+// ── Player ───────────────────────────────────────────────────────────────────
+function drawPlayer() {
+  if (player.inv > 0 && Math.floor(tick / 5) % 2 === 0) return;
+
+  const cx = player.x + PW/2, cy = player.y + PH/2;
+  ctx.save();
+  ctx.translate(cx, cy);
+
+  // Engine flame
+  const fl = 7 + Math.random() * 6;
+  const grad = ctx.createLinearGradient(0, PH/2, 0, PH/2 + fl + 6);
+  grad.addColorStop(0, 'rgba(255,140,0,0.9)');
+  grad.addColorStop(1, 'rgba(255,50,0,0)');
+  ctx.fillStyle = grad;
+  ctx.beginPath(); ctx.ellipse(0, PH/2 + 2, 7, fl, 0, 0, Math.PI*2); ctx.fill();
+
+  // Ship body
+  ctx.shadowColor = '#0ff'; ctx.shadowBlur = 14;
+  ctx.fillStyle = '#0ff';
+  ctx.beginPath();
+  ctx.moveTo(0, -PH/2);
+  ctx.lineTo(PW/2, PH/2);
+  ctx.lineTo(-PW/2, PH/2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // Side wings
+  ctx.fillStyle = '#088';
+  ctx.fillRect(-PW/2 - 6, PH/2 - 11, 10, 8);
+  ctx.fillRect( PW/2 - 4, PH/2 - 11, 10, 8);
+
+  // Cockpit
+  ctx.shadowColor = '#c0f'; ctx.shadowBlur = 8;
+  ctx.fillStyle = '#c0f';
+  ctx.beginPath(); ctx.ellipse(0, -4, 9, 7, 0, 0, Math.PI*2); ctx.fill();
+  ctx.shadowBlur = 0;
+
+  ctx.restore();
+}
+
+// ── Bullets ──────────────────────────────────────────────────────────────────
+function drawBullets() {
+  ctx.shadowBlur = 8;
+  ctx.fillStyle  = '#0ff'; ctx.shadowColor = '#0ff';
+  pb.forEach(b => ctx.fillRect(b.x, b.y, BW, BH));
+  ctx.fillStyle  = '#f55'; ctx.shadowColor = '#f55';
+  eb.forEach(b => ctx.fillRect(b.x, b.y, BW, BH));
+  ctx.shadowBlur = 0;
+}
+
+// ── Explosions ───────────────────────────────────────────────────────────────
+function drawExplosions() {
+  for (const ex of exps) {
+    const p = 1 - ex.t / 22;
+    const r = p * 36;
+    const a = ex.t / 22;
+    const g = ctx.createRadialGradient(ex.x, ex.y, 0, ex.x, ex.y, r);
+    g.addColorStop(0,   `rgba(255,255,120,${a})`);
+    g.addColorStop(0.5, `rgba(255,120,0,${a * 0.7})`);
+    g.addColorStop(1,   'rgba(255,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(ex.x, ex.y, r, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+// ── Overlay (game over / win / paused) ───────────────────────────────────────
+function overlay(title, color, sub) {
+  ctx.fillStyle = 'rgba(0,0,0,0.72)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.shadowColor = color; ctx.shadowBlur = 24;
+  ctx.fillStyle = color;
+  ctx.font = 'bold 62px "Segoe UI", Arial';
+  ctx.fillText(title, W/2, H/2 - 28);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#ddd';
+  ctx.font = '19px "Segoe UI", Arial';
+  ctx.fillText(sub, W/2, H/2 + 28);
+}
+
+// ─── Main loop ───────────────────────────────────────────────────────────────
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
